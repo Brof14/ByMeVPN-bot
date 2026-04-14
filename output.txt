@@ -1,0 +1,19 @@
+2026-04-14 22:21:06,776 | INFO     | async_utils:181 | Static data preloaded for instant responses
+2026-04-14 22:21:06,776 | INFO     | __main__:42 | Static data preloaded
+2026-04-14 22:21:06,844 | INFO     | database:235 | Migration: created ref_bonus_claims table
+2026-04-14 22:21:06,846 | INFO     | database:308 | Migration: created refunds table
+2026-04-14 22:21:06,850 | INFO     | database:324 | Migration: created referral_balance table
+2026-04-14 22:21:06,851 | INFO     | database:341 | Migration: created referral_payouts table
+2026-04-14 22:21:06,851 | INFO     | database:358 | Migration: created referral_earnings table
+2026-04-14 22:21:06,852 | INFO     | database:385 | Migration: created email_auth table
+2026-04-14 22:21:06,852 | INFO     | database:401 | Database initialized: vpnbot.db
+2026-04-14 22:21:06,853 | INFO     | __main__:45 | Database ready
+2026-04-14 22:21:07,821 | INFO     | __main__:50 | 3x-UI connection: ╤юхфшэхэшх ё 3x-UI єёях°эю
+2026-04-14 22:21:07,844 | INFO     | __main__:66 | All routers registered
+2026-04-14 22:21:08,435 | INFO     | __main__:71 | Bot is running. Press Ctrl+C to stop.
+2026-04-14 22:21:08,435 | INFO     | aiogram.dispatcher:527 | Start polling
+2026-04-14 22:21:08,436 | INFO     | notifications:49 | Notification scheduler started
+2026-04-14 22:21:08,436 | INFO     | webhook:282 | YooKassa webhook server starting on 0.0.0.0:8080
+ERROR:    [Errno 10048] error while attempting to bind on address ('0.0.0.0', 8080): юс√ўэю ЁрчЁх°рхЄё  Єюы№ъю юфэю шёяюы№чютрэшх рфЁхёр ёюъхЄр (яЁюЄюъюы/ёхЄхтющ рфЁхё/яюЁЄ)
+2026-04-14 22:21:08,570 | INFO     | aiogram.dispatcher:554 | Polling stopped
+2026-04-14 22:21:08,878 | INFO     | __main__:81 | Bot stopped
