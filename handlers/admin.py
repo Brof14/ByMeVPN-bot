@@ -69,7 +69,9 @@ def _main_kb() -> InlineKeyboardMarkup:
         # Row 7: Promo & System
         [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo_codes"),
          InlineKeyboardButton(text="⚙️ Система", callback_data="admin_system")],
-        # Row 8: Maintenance
+        # Row 8: Mass Actions
+        [InlineKeyboardButton(text="🎁 Выдать всем пробник", callback_data="admin_mass_trial")],
+        # Row 9: Maintenance
         [InlineKeyboardButton(text="🧹 Очистка", callback_data="admin_cleanup")],
     ])
 
@@ -2077,3 +2079,123 @@ async def receive_promo_uses(message: Message, bot: Bot, state: FSMContext):
             "❌ Не удалось создать промокод.",
             reply_markup=_back_kb()
         )
+
+
+# ── Mass trial distribution ───────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin_mass_trial")
+async def cb_mass_trial(callback: CallbackQuery, bot: Bot):
+    if not _is_admin(callback.from_user.id):
+        await safe_answer(callback, "Нет доступа.", alert=True)
+        return
+    
+    await safe_answer(callback)
+    
+    # Show confirmation dialog
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, выдать всем", callback_data="admin_mass_trial_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_menu")
+        ]
+    ])
+    
+    await callback.message.edit_text(
+        "🎁 <b>Массовая выдача пробников</b>\n\n"
+        "Выдать 3-дневный пробный период ВСЕМ пользователям без активных ключей?\n\n"
+        "⚠️ Это может занять некоторое время.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "admin_mass_trial_confirm")
+async def cb_mass_trial_confirm(callback: CallbackQuery, bot: Bot):
+    if not _is_admin(callback.from_user.id):
+        await safe_answer(callback, "Нет доступа.", alert=True)
+        return
+    
+    await safe_answer(callback)
+    
+    # Get all users without active keys
+    from database import get_db
+    db = await get_db()
+    cur = await db.execute(
+        "SELECT DISTINCT u.user_id, u.username "
+        "FROM users u "
+        "LEFT JOIN keys k ON u.user_id = k.user_id AND k.is_active = 1 "
+        "WHERE k.id IS NULL"
+    )
+    rows = await cur.fetchall()
+    
+    if not rows:
+        await callback.message.edit_text(
+            "✅ Нет пользователей без активных ключей.",
+            reply_markup=_back_kb()
+        )
+        return
+    
+    # Process trials
+    success_count = 0
+    failed_count = 0
+    
+    status_msg = await callback.message.edit_text(
+        f"⏳ Выдаю пробники {len(rows)} пользователям...\n"
+        f"✅ Успешно: 0\n"
+        f"❌ Ошибок: 0",
+        reply_markup=_back_kb()
+    )
+    
+    for i, (user_id, username) in enumerate(rows):
+        try:
+            # Check if already used trial
+            from database import has_trial_used
+            if await has_trial_used(user_id):
+                continue
+            
+            # Deliver trial key
+            from subscription import deliver_key
+            success = await deliver_key(
+                bot=bot,
+                user_id=user_id,
+                chat_id=user_id,
+                config_name="🇷🇺 Россия",
+                days=3,
+                limit_ip=1,
+                is_paid=False,
+                method="trial"
+            )
+            
+            if success:
+                success_count += 1
+            else:
+                failed_count += 1
+                
+        except Exception as e:
+            logger.error(f"Failed to deliver trial to {user_id}: {e}")
+            failed_count += 1
+        
+        # Update status every 5 users
+        if (i + 1) % 5 == 0 or i == len(rows) - 1:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Выдаю пробники... ({i+1}/{len(rows)})\n"
+                    f"✅ Успешно: {success_count}\n"
+                    f"❌ Ошибок: {failed_count}",
+                    reply_markup=_back_kb()
+                )
+            except:
+                pass
+        
+        # Small delay to avoid rate limits
+        await asyncio.sleep(0.5)
+    
+    # Final report
+    await status_msg.edit_text(
+        f"✅ <b>Массовая выдача завершена</b>\n\n"
+        f"📊 Всего пользователей: {len(rows)}\n"
+        f"✅ Успешно выдано: {success_count}\n"
+        f"❌ Ошибок: {failed_count}\n"
+        f"⏭️ Пропущено (уже пробовали): {len(rows) - success_count - failed_count}",
+        parse_mode="HTML",
+        reply_markup=_back_kb()
+    )

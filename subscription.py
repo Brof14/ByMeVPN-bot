@@ -231,22 +231,6 @@ async def deliver_key(
         # Execute database operations in parallel
         await asyncio.gather(*db_tasks)
 
-        # Process referral bonuses
-        try:
-            from referral_system_new import process_trial_referral_bonus, process_payment_referral_bonus
-            from database import get_referrer
-            
-            referrer_id = await get_referrer(user_id)
-            if referrer_id and referrer_id != user_id:
-                if method == "trial":
-                    # Convert trial_pending to trial_bonus
-                    await process_trial_referral_bonus(user_id, bot)
-                elif is_paid and amount > 0:
-                    # Payment bonus (already processed in webhook, but ensure it's tracked)
-                    logger.info("Payment bonus already processed for user %d, referrer %d", user_id, referrer_id)
-        except Exception as e:
-            logger.error("Failed to process referral bonus in deliver_key: %s", e)
-
         text = (
             f"Подписка активирована! Спасибо, что выбрали нас❤️\n\n"
             f"Скопируйте ссылку на подписку и посмотрите инструкцию подключения:\n"
