@@ -30,8 +30,8 @@ async def fallback_command(message: Message, bot: Bot, state: FSMContext):
     user_id = message.from_user.id
     await ensure_user(user_id)
 
-    # Clean previous messages but keep user's message (anchor message_id + 1)
-    await _clean_chat(bot, message.chat.id, message.message_id + 1, count=50)
+    # Clean previous messages but keep user's message (anchor message_id + 1) - reduced from 50 to 5
+    await _clean_chat(bot, message.chat.id, message.message_id + 1, count=5)
 
     # Use optimized main menu sender
     name = message.from_user.first_name or "друг"
@@ -52,8 +52,8 @@ async def fallback_text(message: Message, bot: Bot, state: FSMContext):
     user_id = message.from_user.id
     await ensure_user(user_id)
 
-    # Clean previous messages but keep user's message (anchor message_id + 1)
-    await _clean_chat(bot, message.chat.id, message.message_id + 1, count=50)
+    # Clean previous messages but keep user's message (anchor message_id + 1) - reduced from 50 to 5
+    await _clean_chat(bot, message.chat.id, message.message_id + 1, count=5)
 
     # Use optimized main menu sender
     name = message.from_user.first_name or "друг"

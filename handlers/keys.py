@@ -155,7 +155,7 @@ async def cb_key_instructions(callback: CallbackQuery, bot: Bot):
         f"📋 <b>Инструкция подключения</b>\n\n"
         f"🔑 <b>Ключ #{key_id}</b>\n"
         f"🔗 <code>{sub_url}</code>\n\n"
-        f"📱 <b>Выберите ваше устройство:</b>"
+        f"<b>Выберите ваше устройство:</b>"
     )
     
     await callback.message.edit_text(text, reply_markup=connection_guide_kb(), parse_mode="HTML")

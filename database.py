@@ -1101,10 +1101,10 @@ async def add_referral_earning(referrer_id: int, referred_id: int, amount: int =
         if await cur.fetchone():
             return False  # бонус уже начислялся
         
-        # Начисляем бонус
+        # Начисляем бонус с статусом pending
         await db.execute(
-            "INSERT INTO referral_earnings(referrer_id, referred_id, amount, payment_id) VALUES(?,?,?,?)",
-            (referrer_id, referred_id, amount, payment_id)
+            "INSERT INTO referral_earnings(referrer_id, referred_id, amount, payment_id, payment_status) VALUES(?,?,?,?,?)",
+            (referrer_id, referred_id, amount, payment_id, 'pending')
         )
         
         # Обновляем баланс реферала
@@ -1118,6 +1118,71 @@ async def add_referral_earning(referrer_id: int, referred_id: int, amount: int =
         return True
     except Exception as e:
         logger.error("Error adding referral earning: %s", e)
+        await db.rollback()
+        return False
+
+
+async def get_referral_stats_detailed(referrer_id: int = None) -> list:
+    """Получить детальную статистику по рефералам с источниками и оплатами"""
+    db = await get_db()
+    
+    if referrer_id:
+        # Статистика для конкретного реферера
+        query = """
+            SELECT r.referrer_id, r.referred_id, r.source, r.created,
+                   re.amount, re.payment_status, re.created as payment_date,
+                   p.amount as payment_amount, p.created as payment_created
+            FROM referrals r
+            LEFT JOIN referral_earnings re ON r.referrer_id = re.referrer_id AND r.referred_id = re.referred_id
+            LEFT JOIN payments p ON re.payment_id = p.id
+            WHERE r.referrer_id = ?
+            ORDER BY r.created DESC
+        """
+        cur = await db.execute(query, (referrer_id,))
+    else:
+        # Статистика для всех рефереров
+        query = """
+            SELECT r.referrer_id, r.referred_id, r.source, r.created,
+                   re.amount, re.payment_status, re.created as payment_date,
+                   p.amount as payment_amount, p.created as payment_created
+            FROM referrals r
+            LEFT JOIN referral_earnings re ON r.referrer_id = re.referrer_id AND r.referred_id = re.referred_id
+            LEFT JOIN payments p ON re.payment_id = p.id
+            ORDER BY r.created DESC
+        """
+        cur = await db.execute(query)
+    
+    rows = await cur.fetchall()
+    
+    stats = []
+    for row in rows:
+        stats.append({
+            "referrer_id": row[0],
+            "referred_id": row[1],
+            "source": row[2],
+            "referral_date": row[3],
+            "bonus_amount": row[4],
+            "payment_status": row[5],
+            "bonus_date": row[6],
+            "payment_amount": row[7],
+            "payment_date": row[8]
+        })
+    
+    return stats
+
+
+async def update_referral_payment_status(earning_id: int, status: str) -> bool:
+    """Обновить статус выплаты реферала"""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE referral_earnings SET payment_status=? WHERE id=?",
+            (status, earning_id)
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.error("Error updating referral payment status: %s", e)
         await db.rollback()
         return False
 
@@ -1349,13 +1414,18 @@ async def find_user_by_id(user_id: int) -> Optional[dict]:
     }
 
 
-async def delete_user_and_keys(user_id: int) -> bool:
-    """Delete user and all their keys"""
+async def delete_user_and_keys(user_id: int) -> list:
+    """Delete user and all their keys, return list of deleted UUIDs"""
     db = await get_db()
+    # Get UUIDs before deleting
+    cur = await db.execute("SELECT uuid FROM keys WHERE user_id=?", (user_id,))
+    rows = await cur.fetchall()
+    uuids = [row[0] for row in rows if row[0]]
+    
     await db.execute("DELETE FROM keys WHERE user_id=?", (user_id,))
     await db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
     await db.commit()
-    return True
+    return uuids
 
 
 async def set_key_days(key_id: int, days: int) -> bool:
@@ -1497,6 +1567,7 @@ async def extend_key(key_id: int, additional_days: int) -> bool:
     cur = await db.execute("SELECT expiry, uuid FROM keys WHERE id=?", (key_id,))
     row = await cur.fetchone()
     if not row:
+        logger.warning("Key %d not found for extension", key_id)
         return False
     
     current_expiry, client_uuid = row
@@ -1510,7 +1581,10 @@ async def extend_key(key_id: int, additional_days: int) -> bool:
     await db.commit()
     
     if cur.rowcount == 0:
+        logger.warning("Failed to update expiry in DB for key %d", key_id)
         return False
+    
+    logger.info("Extended key %d by %d days (expiry: %s -> %s)", key_id, additional_days, current_expiry, new_expiry)
     
     # Update 3x-UI panel if UUID exists
     if client_uuid:
@@ -1519,6 +1593,8 @@ async def extend_key(key_id: int, additional_days: int) -> bool:
             success = await update_client_expiry(client_uuid, new_expiry)
             if not success:
                 logger.warning("Failed to update expiry in 3x-UI for key %d", key_id)
+            else:
+                logger.info("Successfully updated expiry in 3x-UI for key %d", key_id)
         except Exception as e:
             logger.error("Error updating 3x-UI expiry for key %d: %s", key_id, e)
     

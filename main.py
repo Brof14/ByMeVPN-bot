@@ -67,14 +67,14 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
 
     scheduler_task = asyncio.create_task(start_notification_scheduler(bot))
-    webhook_task = asyncio.create_task(start_webhook_server(bot))
+    # webhook_task = asyncio.create_task(start_webhook_server(bot))  # Disabled: YooKassa webhook not used
     logger.info("Bot is running. Press Ctrl+C to stop.")
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         scheduler_task.cancel()
-        webhook_task.cancel()
+        # webhook_task.cancel()  # Disabled along with webhook server
         await bot.session.close()
         await close_db()
         await close_session()

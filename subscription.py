@@ -38,7 +38,7 @@ async def ask_config_name(
     
     days = context.get("days", 30)
     is_paid = context.get("is_paid", False)
-    limit_ip = 5 if is_paid else 1
+    limit_ip = 5
     amount = context.get("amount", 0)
     currency = context.get("currency", "RUB")
     method = context.get("method", "unknown")
@@ -134,7 +134,7 @@ async def deliver_key_with_generated_name(
     
     days = context.get("days", 30)
     is_paid = context.get("is_paid", False)
-    limit_ip = 5 if is_paid else 1  # All paid plans support up to 5 devices, trial stays at 1
+    limit_ip = 5  # All plans (trial and paid) support up to 5 devices
     amount = context.get("amount", 0)
     currency = context.get("currency", "RUB")
     method = context.get("method", "unknown")

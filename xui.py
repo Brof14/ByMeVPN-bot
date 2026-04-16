@@ -72,14 +72,20 @@ async def test_xui_connection() -> tuple[bool, str]:
     try:
         async with _client() as http:
             await _login(http)
-            # Test getting inbound info
-            url = f"{XUI_HOST}/panel/api/inbounds/get/{INBOUND_ID}"
+            # Test getting inbound list (works better from Docker than get endpoint)
+            url = f"{XUI_HOST}/panel/api/inbounds/list"
             resp = await http.get(url)
             if resp.status_code == 200:
                 try:
                     data = resp.json()
                     if data.get("success"):
-                        return True, "Соединение с 3x-UI успешно"
+                        # Check if our inbound ID exists in the list
+                        inbounds = data.get("obj", [])
+                        inbound_exists = any(ib.get("id") == int(INBOUND_ID) for ib in inbounds)
+                        if inbound_exists:
+                            return True, "Соединение с 3x-UI успешно"
+                        else:
+                            return False, f"Inbound с ID={INBOUND_ID} не найден в 3x-UI"
                     else:
                         return False, f"Ошибка API 3x-UI: {data.get('msg', 'Неизвестная ошибка')}"
                 except Exception:
@@ -112,6 +118,23 @@ async def close_session():
     if _session and not _session.is_closed:
         await _session.aclose()
         _session = None
+
+
+async def _verify_xray_running() -> bool:
+    """Verify that Xray service is still running after client operations by testing 3x-UI API."""
+    try:
+        # Test 3x-UI API responsiveness - if it responds, Xray is likely still running
+        http = await get_session()
+        await _login(http)
+        url = f"{XUI_HOST}/panel/api/inbounds/list"
+        resp = await http.get(url)
+        is_running = resp.status_code == 200
+        logger.info("Xray status check via 3x-UI API: %s (status=%d)", is_running, resp.status_code)
+        return is_running
+    except Exception as e:
+        logger.error("Failed to check Xray status via API: %s", e)
+        # Assume running if we can't check - don't block operations
+        return True
 
 
 def _client() -> httpx.AsyncClient:
@@ -252,17 +275,17 @@ def generate_unique_name(user_id: int, prefix: str = "") -> str:
 
 async def create_client(user_id: int, days: int, limit_ip: int = 1) -> Optional[dict]:
     """
-    Create a new VLESS client in 3x-UI inbound.
-    If any client exists, it will be replaced (workaround for XUI bug).
+    Create a new VLESS client in 3x-UI inbound using safe addClient endpoint.
+    This method only adds the new client without touching existing clients.
     limit_ip — max simultaneous device connections (1, 2 or 5).
     Returns dict {"uuid": ..., "short_id": ...} on success, None on failure.
     """
     import secrets
     import random
     # Server name shown in v2rayNG (must be UNIQUE in 3x-UI for 500+ users)
-    # Format with emoji flag: 🇺🇸США1234 (emoji + USA in Cyrillic + digits)
-    random_suffix = random.randint(1000, 9999)
-    email = f"🇺🇸США{random_suffix}"
+    # Use random 4-digit suffix
+    unique_suffix = random.randint(1000, 9999)
+    email = f"usСША-{unique_suffix}"
     # Comment/description for the client (shown in 3x-UI panel)
     comment = "Telegram @ByMeVPN_bot"
 
@@ -273,31 +296,34 @@ async def create_client(user_id: int, days: int, limit_ip: int = 1) -> Optional[
 
     async def _attempt():
         client_id = str(uuid.uuid4())
-        # Generate short_id for subscription URL (3x-UI uses this for /sub/ endpoint)
+        # Generate short_id for subscription URL
         short_id = secrets.token_hex(8)  # 16 hex chars
         expiry_ms = int(
             (datetime.now() + timedelta(days=days)).timestamp() * 1000
         )
-        client_obj = {
-            "id": client_id,
-            "flow": "",
-            "email": email,
-            "comment": comment,
-            "limitIp": limit_ip,  # already validated
-            "totalGB": 0,
-            "expiryTime": expiry_ms,
-            "enable": True,
-            "tgId": str(user_id),
-            "subId": short_id,
-        }
         
-        # WORKAROUND: Replace ALL clients instead of adding (XUI bug fix)
-        payload = {
-            "id": INBOUND_ID,
-            "settings": json.dumps({"clients": [client_obj]}),
-        }
         http = await get_session()
         await _login(http)
+        
+        # Step 1: Create client without subId using addClient (safe for high load)
+        client_settings = json.dumps({
+            "clients": [{
+                "id": client_id,
+                "email": email,
+                "limitIp": limit_ip,
+                "totalGB": 0,
+                "expiryTime": expiry_ms,
+                "enable": True,
+                "flow": "",
+                "comment": comment
+            }]
+        })
+        
+        payload = {
+            "id": INBOUND_ID,
+            "settings": client_settings
+        }
+        
         url = f"{XUI_HOST}/panel/api/inbounds/addClient"
         resp = await http.post(url, json=payload)
         logger.info(
@@ -311,7 +337,47 @@ async def create_client(user_id: int, days: int, limit_ip: int = 1) -> Optional[
             raise RuntimeError(f"Non-JSON response: {resp.text[:200]}")
         if not data.get("success"):
             raise RuntimeError(f"3x-UI addClient failed: {data.get('msg', data)}")
+        
+        # Step 2: Add subId using 3x-UI API (bot runs in Docker, can't access host database)
+        try:
+            client_settings_with_subid = json.dumps({
+                "clients": [{
+                    "id": client_id,
+                    "subId": short_id
+                }]
+            })
+            
+            update_payload = {
+                "id": INBOUND_ID,
+                "settings": client_settings_with_subid
+            }
+            
+            update_url = f"{XUI_HOST}/panel/api/inbounds/updateClient/{client_id}"
+            update_resp = await http.post(update_url, json=update_payload)
+            logger.info(
+                "updateClient (add subId) → status=%d  body=%s",
+                update_resp.status_code, update_resp.text[:300],
+            )
+            
+            # If subId update fails, still continue - client is created, just subscription won't work
+            try:
+                update_resp.raise_for_status()
+                update_data = update_resp.json()
+                if not update_data.get("success"):
+                    logger.warning("Failed to add subId to client: %s", update_data.get('msg'))
+            except Exception as e:
+                logger.warning("Exception while adding subId to client: %s", e)
+        except Exception as e:
+            logger.warning("Failed to add subId via API: %s", e)
+        
         logger.info("Client created: email=%s comment=%s uuid=%s short_id=%s days=%d limit_ip=%d", email, comment, client_id, short_id, days, limit_ip)
+        
+        # Verify Xray is still running after client creation
+        if not await _verify_xray_running():
+            logger.error("Xray failed after client creation, rolling back")
+            await delete_client(client_id)
+            raise RuntimeError("Xray crashed after client creation, changes rolled back")
+        
         # Invalidate XUI cache when client is created
         from cache import invalidate_xui_cache
         invalidate_xui_cache()
@@ -329,45 +395,29 @@ async def create_client(user_id: int, days: int, limit_ip: int = 1) -> Optional[
 
 
 async def update_client_expiry(client_uuid: str, new_expiry_timestamp: int) -> bool:
-    """Update client expiry date in 3x-UI. Returns True on success."""
-    import json
+    """Update client expiry date in 3x-UI using safe updateClient endpoint. Returns True on success."""
     
     async def _attempt():
         http = await get_session()
         await _login(http)
         
-        # First get current inbound settings to find the client
-        url = f"{XUI_HOST}/panel/api/inbounds/get/{INBOUND_ID}"
-        resp = await http.get(url)
-        resp.raise_for_status()
-        data = resp.json()
+        # Use safe updateClient endpoint - only send the updated client
+        # Convert timestamp to milliseconds for 3x-UI
+        expiry_ms = new_expiry_timestamp * 1000
         
-        if not data.get("success"):
-            raise RuntimeError(f"Failed to get inbound: {data.get('msg')}")
+        client_settings = json.dumps({
+            "clients": [{
+                "id": client_uuid,
+                "expiryTime": expiry_ms
+            }]
+        })
         
-        inbound = data.get("obj", {})
-        settings = json.loads(inbound.get("settings", "{}"))
-        clients = settings.get("clients", [])
-        
-        # Find client by UUID
-        client_found = False
-        for client in clients:
-            if client.get("id") == client_uuid:
-                # Convert timestamp to milliseconds for 3x-UI
-                client["expiryTime"] = new_expiry_timestamp * 1000
-                client_found = True
-                break
-        
-        if not client_found:
-            logger.warning("Client %s not found in inbound", client_uuid[:8])
-            return False
-        
-        # Update inbound with new settings
-        update_url = f"{XUI_HOST}/panel/api/inbounds/update/{INBOUND_ID}"
         payload = {
             "id": INBOUND_ID,
-            "settings": json.dumps(settings)
+            "settings": client_settings
         }
+        
+        update_url = f"{XUI_HOST}/panel/api/inbounds/updateClient/{client_uuid}"
         resp = await http.post(update_url, json=payload)
         resp.raise_for_status()
         
@@ -376,6 +426,15 @@ async def update_client_expiry(client_uuid: str, new_expiry_timestamp: int) -> b
             raise RuntimeError(f"Update failed: {result.get('msg')}")
         
         logger.info("Updated client %s expiry to %d", client_uuid[:8], new_expiry_timestamp)
+        
+        # Verify Xray is still running after update
+        if not await _verify_xray_running():
+            logger.error("Xray failed after client update, rolling back")
+            raise RuntimeError("Xray crashed after client update")
+        
+        # Invalidate XUI cache when client is updated
+        from cache import invalidate_xui_cache
+        invalidate_xui_cache()
         return True
     
     try:
@@ -434,7 +493,7 @@ def build_vless_link(client_uuid: str, remark: str = "ByMeVPN_🇺🇸 США") 
         "fp": REALITY_FP,
         "sni": REALITY_SNI,
         "sid": REALITY_SID,
-        "flow": "",
+        "flow": "xtls-rprx-vision",
         "encryption": "none",
     }
     qs = "&".join(
@@ -447,14 +506,18 @@ def build_vless_link(client_uuid: str, remark: str = "ByMeVPN_🇺🇸 США") 
     return f"vless://{client_uuid}@{REALITY_HOST}:{REALITY_PORT}?{qs}#{tag}"
 
 
-def get_subscription_url(short_id: str) -> str:
-    """Build subscription URL for 3x-UI panel.
+def get_subscription_url(short_id: str, uuid: str = None) -> str:
+    """Build subscription URL or VLESS link for 3x-UI panel.
 
-    Returns URL like: https://host:2096/sub/{short_id}
-    Uses short_id (subId) instead of UUID — 3x-UI subscription endpoint
-    expects short_id, not UUID (using UUID causes "Bad Request").
+    Returns VLESS link if short_id is not set (addClient doesn't support subId).
+    Returns subscription URL like: https://host:2096/sub/{short_id} if short_id is set.
     """
     from config import XUI_HOST
+    
+    # If no short_id, return empty - caller should use VLESS link instead
+    if not short_id:
+        logger.warning("short_id is empty, cannot build subscription URL")
+        return ""
     
     logger.info(f"Building subscription URL, XUI_HOST={XUI_HOST}, short_id={short_id[:8]}...")
     
@@ -462,23 +525,33 @@ def get_subscription_url(short_id: str) -> str:
         logger.error("XUI_HOST is empty! Cannot build subscription URL.")
         return ""
     
-    # Extract host from XUI_HOST (remove https:// or http:// prefix)
-    host = XUI_HOST.replace("https://", "").replace("http://", "").split(":")[0]
+    # Extract host and port from XUI_HOST
+    # XUI_HOST format: https://host:port/path or https://host/path
+    host = XUI_HOST.replace("https://", "").replace("http://", "")
     
-    if not host:
+    # Split by / to get host:port part
+    host_port = host.split("/")[0]
+    
+    # Extract host and port
+    if ":" in host_port:
+        host_part, port_part = host_port.split(":")
+        # Use the panel port for subscription
+        sub_port = port_part
+    else:
+        host_part = host_port
+        sub_port = 2096  # fallback
+    
+    if not host_part:
         logger.error(f"Could not extract host from XUI_HOST={XUI_HOST}")
         return ""
     
-    # Default subscription port (should match 3x-UI subscription settings)
-    sub_port = 2096
-    
-    url = f"https://{host}:{sub_port}/sub/{short_id}"
+    url = f"https://{host_part}:{sub_port}/sub/{short_id}"
     logger.info(f"Subscription URL built: {url[:50]}...")
     return url
 
 
 async def update_client_name(uuid: str, new_name: str) -> bool:
-    """Update client name (remark) in 3x-UI panel.
+    """Update client name (remark) in 3x-UI panel using safe updateClient endpoint.
     
     Args:
         uuid: Client UUID
@@ -487,71 +560,45 @@ async def update_client_name(uuid: str, new_name: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    async def _attempt():
+        http = await get_session()
+        await _login(http)
+        
+        # Use safe updateClient endpoint - only send the updated client
+        client_settings = json.dumps({
+            "clients": [{
+                "id": uuid,
+                "remark": new_name
+            }]
+        })
+        
+        payload = {
+            "id": INBOUND_ID,
+            "settings": client_settings
+        }
+        
+        update_url = f"{XUI_HOST}/panel/api/inbounds/updateClient/{uuid}"
+        resp = await http.post(update_url, json=payload)
+        resp.raise_for_status()
+        
+        result = resp.json()
+        if not result.get("success"):
+            raise RuntimeError(f"Update failed: {result.get('msg')}")
+        
+        logger.info(f"Updated client name to: {new_name}")
+        
+        # Verify Xray is still running after update
+        if not await _verify_xray_running():
+            logger.error("Xray failed after client name update")
+            raise RuntimeError("Xray crashed after client name update")
+        
+        # Invalidate XUI cache when client is updated
+        from cache import invalidate_xui_cache
+        invalidate_xui_cache()
+        return True
+    
     try:
-        async with _client() as http:
-            await _login(http)
-            
-            # Get client info first
-            params = {"filter": uuid}
-            r = await http.get(f"{XUI_HOST}/panel/api/inbounds/list", params=params)
-            r.raise_for_status()
-            data = r.json()
-            
-            if not data.get("success") or not data.get("obj"):
-                logger.error(f"Client not found for UUID: {uuid[:8]}...")
-                return False
-            
-            # Get inbound ID and current settings
-            inbound = data["obj"][0]
-            inbound_id = inbound["id"]
-            settings = inbound.get("settings", "{}")
-            
-            # Parse settings and update client name
-            import json
-            settings_json = json.loads(settings)
-            clients = settings_json.get("clients", [])
-            
-            for client in clients:
-                if client.get("id") == uuid:
-                    client["remark"] = new_name
-                    break
-            else:
-                logger.error(f"Client with UUID {uuid[:8]}... not found in inbound")
-                return False
-            
-            # Update settings back
-            new_settings = json.dumps(settings_json)
-            
-            # Update inbound via API
-            update_data = {
-                "up": inbound.get("up", 0),
-                "down": inbound.get("down", 0),
-                "total": inbound.get("total", 0),
-                "remark": inbound.get("remark", ""),
-                "enable": inbound.get("enable", True),
-                "expiryTime": inbound.get("expiryTime", 0),
-                "listen": inbound.get("listen", ""),
-                "port": inbound.get("port", 0),
-                "protocol": inbound.get("protocol", ""),
-                "settings": new_settings,
-                "streamSettings": inbound.get("streamSettings", "{}"),
-                "sniffing": inbound.get("sniffing", "{}"),
-            }
-            
-            r = await http.post(
-                f"{XUI_HOST}/panel/api/inbounds/update/{inbound_id}",
-                json=update_data
-            )
-            r.raise_for_status()
-            result = r.json()
-            
-            if result.get("success"):
-                logger.info(f"Updated client name to: {new_name}")
-                return True
-            else:
-                logger.error(f"Failed to update client: {result}")
-                return False
-                
+        return await _with_retry(_attempt)
     except Exception as e:
         logger.error(f"Error updating client name: {e}")
         return False

@@ -75,26 +75,27 @@ async def _user_state(user_id: int) -> str:
 
 
 @monitor_performance("clean_chat")
-async def _clean_chat(bot: Bot, chat_id: int, anchor_msg_id: int, count: int = 50) -> None:
+async def _clean_chat(bot: Bot, chat_id: int, anchor_msg_id: int, count: int = 3) -> None:
     """
     Delete the last `count` messages up to and including anchor_msg_id.
-    Runs all deletes concurrently and swallows errors (already deleted, too old, etc).
+    Runs all deletes concurrently with timeout for speed.
     """
-    # Get all message IDs to delete
-    ids = [mid for mid in range(anchor_msg_id, anchor_msg_id - count, -1) if mid > 0]
+    # Get message IDs to delete (max 3 for speed)
+    ids = [mid for mid in range(anchor_msg_id, anchor_msg_id - min(count, 3), -1) if mid > 0]
+    if not ids:
+        return
     
-    # Create batches for faster deletion (Telegram API limit)
-    batch_size = 10
-    tasks = []
+    # Delete with timeout for each message - don't wait for slow/old messages
+    async def delete_with_timeout(msg_id):
+        try:
+            await asyncio.wait_for(bot.delete_message(chat_id, msg_id), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass  # Skip slow deletions
+        except Exception:
+            pass  # Ignore all errors (message too old, already deleted, etc.)
     
-    for i in range(0, len(ids), batch_size):
-        batch = ids[i:i + batch_size]
-        # Create concurrent tasks for this batch
-        batch_tasks = [bot.delete_message(chat_id, mid) for mid in batch]
-        tasks.extend(batch_tasks)
-    
-    # Execute all tasks concurrently for instant deletion
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # Execute all deletes concurrently
+    await asyncio.gather(*[delete_with_timeout(mid) for mid in ids], return_exceptions=True)
 
 
 def _referral_welcome_kb() -> InlineKeyboardMarkup:
@@ -182,6 +183,26 @@ async def _send_main_menu(
 
 
 # ---------------------------------------------------------------------------
+# /proxy
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "/proxy")
+@monitor_performance("proxy_command")
+async def cmd_proxy(message: Message, bot: Bot) -> None:
+    """Show proxy connection button."""
+    text = (
+        "🔗 <b>Подключение к прокси</b>\n\n"
+        "Нажмите кнопку ниже, чтобы подключиться к прокси в Telegram.\n\n"
+        "Это поможет обойти блокировки и использовать Telegram без ограничений."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔌 Подключить прокси", url="tg://proxy?server=hi.notmescat.net&port=7443&secret=ee4b9ba5fcb813d00ef6f7c5a0302f182f68692e6e6f746d65736361742e6e6574")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu")]
+    ])
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
 
@@ -209,13 +230,53 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         # Process referral (set referrer + give bonus +5 days)
         if ref_id != user_id:
             try:
+                from database import set_referrer, get_user_keys, extend_key
+                
                 existing_keys = await get_user_keys(user_id)
                 if not existing_keys:
                     # New referral - show welcome screen
                     is_new_referral = True
                     referral_processed = True
                     
-                    # Log referral click (referral system removed)
+                    # Set referrer with source
+                    await set_referrer(user_id, ref_id, source="telegram")
+                    
+                    # Extend referrer's key by 5 days
+                    referrer_keys = await get_user_keys(ref_id)
+                    if referrer_keys:
+                        # Extend the first active key
+                        for key in referrer_keys:
+                            if key['expiry'] > int(time.time()):
+                                await extend_key(key['id'], 5)
+                                # Notify referrer with beautiful text
+                                try:
+                                    await bot.send_message(
+                                        ref_id,
+                                        "🎊 <b>Привлекли нового реферала!</b>\n\n"
+                                        "✨ По вашей ссылке перешёл новый пользователь\n"
+                                        "🔑 Ваш ключ продлён на 5 дней\n"
+                                        "💚 Продолжайте приглашать друзей!",
+                                        parse_mode="HTML"
+                                    )
+                                except Exception as notify_error:
+                                    logger.error("Failed to notify referrer: %s", notify_error)
+                                break
+                    
+                    # Send beautiful message to new user with button
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            "🎁 <b>Поздравляем! Вы перешли по реферальной ссылке</b>\n\n"
+                            "🌟 Для вас подарок — <b>3 дня бесплатно</b>\n"
+                            "🚀 Нажмите кнопку ниже, чтобы забрать свой ключ",
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                InlineKeyboardButton(text="🎁 Забрать 3 дня бесплатно", callback_data=f"claim_trial:{ref_id}")
+                            ]])
+                        )
+                    except Exception as msg_error:
+                        logger.error("Failed to send referral welcome message: %s", msg_error)
+                    
                     logger.info("Referral click from user %s with code %s", user_id, args[1])
             except Exception as e:
                 logger.error("Error processing referral: %s", e)
@@ -227,6 +288,81 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     )
     
     # Не удаляем сообщения после /start, чтобы избежать бесконечной кнопки Старт
+
+
+# ---------------------------------------------------------------------------
+# Claim trial from referral link
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("claim_trial:"))
+async def cb_claim_trial(callback: CallbackQuery, bot: Bot):
+    """Handle claim trial button from referral link"""
+    await safe_answer(callback)
+    
+    user_id = callback.from_user.id
+    ref_id = int(callback.data.split(":")[1])
+    
+    from database import has_trial_used, create_key, get_user_keys
+    import time
+    
+    # Check if user already has a key or used trial
+    existing_keys = await get_user_keys(user_id)
+    trial_used = await has_trial_used(user_id)
+    
+    if existing_keys or trial_used:
+        await callback.message.edit_text(
+            "❌ Вы уже используете VPN или уже получали пробный период.\n\n"
+            "Если вам нужен новый ключ, выберите тариф в меню.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu")
+            ]])
+        )
+        return
+    
+    # Create trial key (3 days)
+    try:
+        from xui import create_client, get_subscription_url
+        client_result = await create_client(user_id=user_id, days=3, limit_ip=5)
+        
+        if client_result:
+            sub_url = get_subscription_url(client_result["short_id"])
+            await create_key(
+                user_id=user_id,
+                key=sub_url,
+                uuid=client_result["uuid"],
+                short_id=client_result["short_id"],
+                days=3,
+                limit_ip=5,
+                remark="Реферальный триал"
+            )
+            
+            await callback.message.edit_text(
+                "🎉 <b>Ваш пробный ключ создан!</b>\n\n"
+                f"🔑 <b>Ключ:</b> <code>{sub_url}</code>\n"
+                f"⏳ <b>Срок:</b> 3 дня\n"
+                f"📱 <b>Устройств:</b> 5\n\n"
+                "🚀 Подключайтесь и пользуйтесь!",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="📱 Инструкция", callback_data=f"guide:{client_result['uuid']}"),
+                    InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu")
+                ]])
+            )
+        else:
+            await callback.message.edit_text(
+                "❌ Не удалось создать ключ. Попробуйте позже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu")
+                ]])
+            )
+    except Exception as e:
+        logger.error("Error creating trial key for referral: %s", e)
+        await callback.message.edit_text(
+            "❌ Произошла ошибка. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu")
+            ]])
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +430,7 @@ async def cb_trial_ref(callback: CallbackQuery, bot: Bot, state: FSMContext):
             "days": TRIAL_DAYS, "prefix": "trial_ref", "is_paid": False,
             "amount": 0, "currency": "RUB", "method": "trial",
             "payload": f"trial_ref_{user_id}", "_trial_user_id": user_id,
-            "limit_ip": 1,  # Trial is always 1 device only
+            "limit_ip": 5,
         },
     )
 
@@ -436,21 +572,21 @@ async def cb_key_instructions(callback: CallbackQuery, bot: Bot):
         f"📋 <b>Инструкция подключения</b>\n\n"
         f"🔑 <b>Ключ #{key_id}</b>\n"
         f"🔗 <code>{sub_url}</code>\n\n"
-        f"📱 <b>Выберите ваше устройство:</b>"
+        f"<b>Выберите ваше устройство:</b>"
     )
     
     # Create custom keyboard with back to key button
     kb = InlineKeyboardBuilder()
     for name, cb in [
-        ("🍎 iOS", "guide_ios"),
-        ("📱 Android", "guide_android"),
-        ("💻 Windows", "guide_windows"),
-        ("🍏 macOS", "guide_macos"),
-        ("🐧 Linux", "guide_linux"),
+        ("iOS", "guide_ios"),
+        ("Android", "guide_android"),
+        ("Windows", "guide_windows"),
+        ("macOS", "guide_macos"),
+        ("Linux", "guide_linux"),
     ]:
         kb.row(InlineKeyboardButton(text=name, callback_data=cb))
-    kb.row(InlineKeyboardButton(text="◀️ Назад к ключу", callback_data=f"key_details:{key_id}"))
-    kb.row(InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_to_menu"))
+    kb.row(InlineKeyboardButton(text="Назад к ключу", callback_data=f"key_details:{key_id}"))
+    kb.row(InlineKeyboardButton(text="В главное меню", callback_data="back_to_menu"))
     
     await callback.message.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 

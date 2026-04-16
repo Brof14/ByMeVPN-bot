@@ -30,6 +30,7 @@ from database import (
     get_payment_stats,
     get_all_keys_paginated, get_keys_count,
     create_promo_code, get_all_promo_codes, delete_promo_code, validate_promo_code,
+    has_trial_used, get_db,
 )
 from states import AdminFlow
 from utils import safe_answer
@@ -70,7 +71,8 @@ def _main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo_codes"),
          InlineKeyboardButton(text="⚙️ Система", callback_data="admin_system")],
         # Row 8: Mass Actions
-        [InlineKeyboardButton(text="🎁 Выдать всем пробник", callback_data="admin_mass_trial")],
+        [InlineKeyboardButton(text="🎁 Выдать всем пробник (3д)", callback_data="admin_mass_trial"),
+         InlineKeyboardButton(text="🎁 Пробник 5 дней всем", callback_data="admin_mass_trial_5d")],
         # Row 9: Maintenance
         [InlineKeyboardButton(text="🧹 Очистка", callback_data="admin_cleanup")],
     ])
@@ -186,6 +188,120 @@ async def cmd_admin(message: Message, state: FSMContext):
         "👇 Выберите действие:",
         parse_mode="HTML", reply_markup=_main_kb()
     )
+
+
+@router.message(F.text.startswith("/give_trial_all"))
+async def cmd_give_trial_all(message: Message, bot: Bot):
+    """
+    Admin command: give trial keys to ALL users with specified days.
+    Usage: /give_trial_all <days>
+    Example: /give_trial_all 5
+    """
+    if not _is_admin(message.from_user.id):
+        logger.warning(f"Unauthorized /give_trial_all attempt from user {message.from_user.id}")
+        return
+    
+    # Parse days parameter
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "❌ Укажите количество дней.\n"
+            "Пример: <code>/give_trial_all 5</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        days = int(parts[1])
+        if days < 1 or days > 365:
+            await message.answer("❌ Количество дней должно быть от 1 до 365.")
+            return
+    except ValueError:
+        await message.answer("❌ Неверное количество дней. Укажите число.")
+        return
+    
+    # Get all users
+    db = await get_db()
+    cur = await db.execute("SELECT user_id FROM users")
+    rows = await cur.fetchall()
+    
+    if not rows:
+        await message.answer("ℹ️ В базе нет пользователей.")
+        return
+    
+    # Status message
+    status_msg = await message.answer(
+        f"⏳ Выдача пробников {len(rows)} пользователям на {days} дней...\n"
+        f"✅ Успешно: 0\n"
+        f"❌ Ошибок: 0\n"
+        f"⏭️ Пропущено: 0"
+    )
+    
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    
+    from subscription import deliver_key
+    
+    for i, (user_id,) in enumerate(rows):
+        try:
+            # Reset trial flag so user can receive the key
+            await reset_trial_for_user(user_id)
+            
+            # Deliver trial key
+            success = await deliver_key(
+                bot=bot,
+                user_id=user_id,
+                chat_id=user_id,
+                config_name=f"Trial-{user_id}",
+                days=days,
+                limit_ip=1,
+                is_paid=False,
+                amount=0,
+                currency="RUB",
+                method="admin_mass_trial",
+                payload=f"mass_trial_{user_id}_{days}d",
+            )
+            
+            if success:
+                success_count += 1
+                logger.info(f"Mass trial: delivered {days} days to user {user_id}")
+            else:
+                failed_count += 1
+                logger.warning(f"Mass trial: failed to deliver to user {user_id}")
+                
+        except Exception as e:
+            failed_count += 1
+            logger.error(f"Mass trial: error delivering to {user_id}: {e}")
+        
+        # Update status every 5 users
+        if (i + 1) % 5 == 0 or i == len(rows) - 1:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Выдача пробников... ({i+1}/{len(rows)})\n"
+                    f"✅ Успешно: {success_count}\n"
+                    f"❌ Ошибок: {failed_count}\n"
+                    f"⏭️ Пропущено: {skipped_count}"
+                )
+            except:
+                pass
+        
+        # Small delay to avoid rate limits
+        await asyncio.sleep(0.3)
+    
+    # Final report
+    await status_msg.edit_text(
+        f"✅ <b>Массовая выдача пробников завершена</b>\n\n"
+        f"📊 <b>Параметры:</b> {days} дней каждому\n"
+        f"👥 <b>Всего пользователей:</b> {len(rows)}\n"
+        f"✅ <b>Успешно выдано:</b> {success_count}\n"
+        f"❌ <b>Ошибок:</b> {failed_count}\n"
+        f"⏭️ <b>Пропущено:</b> {skipped_count}",
+        parse_mode="HTML"
+    )
+    
+    logger.info(f"Mass trial completed: {success_count} success, {failed_count} failed, "
+                f"{skipped_count} skipped out of {len(rows)} users ({days} days each)")
 
 
 @router.callback_query(F.data == "admin_menu")
@@ -804,7 +920,7 @@ async def cb_grant_trial(callback: CallbackQuery, bot: Bot, state: FSMContext):
         chat_id=uid,
         config_name=config_name,
         days=TRIAL_DAYS,
-        limit_ip=1,
+        limit_ip=5,
         is_paid=False,
         amount=0,
         currency="RUB",
@@ -815,7 +931,7 @@ async def cb_grant_trial(callback: CallbackQuery, bot: Bot, state: FSMContext):
     if success:
         await callback.message.answer(
             f"✅ Пробный ключ выдан пользователю <code>{uid}</code> "
-            f"на {TRIAL_DAYS} дней (1 устройство).",
+            f"на {TRIAL_DAYS} дней (5 устройств).",
             parse_mode="HTML",
             reply_markup=_back_kb(),
         )
@@ -1351,19 +1467,14 @@ async def cb_referrals_main(callback: CallbackQuery):
         await safe_answer(callback, "Нет доступа.", alert=True); return
     await safe_answer(callback)
     
-    from database import get_all_referral_stats
-    from referral_system_new import get_referral_stats_with_free_days
+    from database import get_referral_stats_detailed
     
-    # Get top referrers with detailed stats
-    referrers = await get_all_referral_stats()
+    # Get detailed referral stats
+    referral_stats = await get_referral_stats_detailed()
     
-    # Convert to list and limit to 20
-    referrers_list = [{"user_id": uid, "total_referrals": stats.get("total_referrals", 0)} for uid, stats in referrers.items()]
-    referrers_list = referrers_list[:20]
-    
-    if not referrers_list:
+    if not referral_stats:
         await callback.message.edit_text(
-            "<b>Управление рефералами</b>\n\n"
+            "<b>📊 Учёт рефералов</b>\n\n"
             "Пока нет реферальных данных.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Назад", callback_data="admin_menu")
@@ -1371,38 +1482,65 @@ async def cb_referrals_main(callback: CallbackQuery):
         )
         return
     
-    text = "<b>🏆 Топ рефералы</b>\n\n"
-    for i, ref in enumerate(referrers_list[:10], 1):
-        # Get detailed stats including free/paid days
-        detailed_stats = await get_referral_stats_with_free_days(ref["user_id"])
+    # Group by referrer
+    referrers_data = {}
+    for stat in referral_stats:
+        ref_id = stat["referrer_id"]
+        if ref_id not in referrers_data:
+            referrers_data[ref_id] = {
+                "total_referrals": 0,
+                "total_bonus": 0,
+                "paid_bonus": 0,
+                "pending_bonus": 0,
+                "sources": set(),
+                "referrals": []
+            }
+        referrers_data[ref_id]["total_referrals"] += 1
+        referrers_data[ref_id]["sources"].add(stat["source"])
+        referrers_data[ref_id]["referrals"].append(stat)
         
+        if stat["bonus_amount"]:
+            referrers_data[ref_id]["total_bonus"] += stat["bonus_amount"]
+            if stat["payment_status"] == "paid":
+                referrers_data[ref_id]["paid_bonus"] += stat["bonus_amount"]
+            else:
+                referrers_data[ref_id]["pending_bonus"] += stat["bonus_amount"]
+    
+    # Convert to list and sort by total referrals
+    referrers_list = sorted(
+        [{"user_id": uid, **data} for uid, data in referrers_data.items()],
+        key=lambda x: x["total_referrals"],
+        reverse=True
+    )[:20]
+    
+    text = "<b>📊 Учёт рефералов</b>\n\n"
+    for i, ref in enumerate(referrers_list[:10], 1):
+        sources = ", ".join(ref["sources"])
         text += (
-            f"{i}. <code>{ref['user_id']}</code> — "
-            f"{ref['total_referrals']} рефералов\n"
-            f"   🎁 Бесплатных дней: {detailed_stats.get('free_days', 0)}\n"
-            f"   💰 Платных дней: {detailed_stats.get('paid_days', 0)}\n"
-            f"   ⏳ Ожидают: {detailed_stats.get('pending_bonuses', 0)}\n\n"
+            f"<b>{i}. Реферал {ref['user_id']}</b>\n"
+            f"   👥 Привлечено: {ref['total_referrals']}\n"
+            f"   💰 Всего бонусов: {ref['total_bonus']}₽\n"
+            f"   ✅ Выплачено: {ref['paid_bonus']}₽\n"
+            f"   ⏳ Ожидает: {ref['pending_bonus']}₽\n"
+            f"   📍 Источники: {sources}\n\n"
         )
     
-    if len(referrers_list) > 10:
-        text += f"... и еще {len(referrers_list) - 10} рефералов\n\n"
+    text += f"Всего рефералов: {len(referrers_list)}\n"
+    text += "Нажмите на ID реферала для деталей"
     
-    # Create user detail buttons
-    kb_rows = []
-    for ref in referrers_list[:5]:  # Top 5 with detail buttons
-        kb_rows.append([InlineKeyboardButton(
-            text=f"👤 Детали ID {ref['user_id']}",
-            callback_data=f"admin_referral_details:{ref['user_id']}"
-        )])
+    # Build keyboard
+    keyboard = []
+    for ref in referrers_list[:10]:
+        keyboard.append([
+            InlineKeyboardButton(text=f"👤 {ref['user_id']} ({ref['total_referrals']} рефер.)", callback_data=f"admin_referral_details:{ref['user_id']}")
+        ])
+    keyboard.append([InlineKeyboardButton(text="Назад", callback_data="admin_menu")])
     
-    kb_rows.extend([
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_referrals")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_menu")]
-    ])
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
 
 
 @router.callback_query(F.data.startswith("admin_referral_details:"))
@@ -1411,52 +1549,61 @@ async def cb_referral_details(callback: CallbackQuery):
         await safe_answer(callback, "Нет доступа.", alert=True); return
     await safe_answer(callback)
     
-    from database import get_referral_events, get_referral_stats
-    from referral_system_new import get_referral_stats_with_free_days
+    from datetime import datetime
+    from database import get_referral_stats_detailed
     
     referrer_id = int(callback.data.split(":")[1])
     
-    # Get referral summary and events
-    summary = await get_referral_stats(referrer_id)
-    events = await get_referral_events(referrer_id, limit=20)
-    detailed_stats = await get_referral_stats_with_free_days(referrer_id)
+    # Get detailed stats for this referrer
+    referral_stats = await get_referral_stats_detailed(referrer_id)
     
-    text = (
-        f"<b>Детали реферала {referrer_id}</b>\n\n"
-        f"<b>Статистика:</b>\n"
-        f"• Всего рефералов: {summary['total']}\n"
-        f"• Оплативших: {summary['paid']}\n"
-        f"• Ожидают оплаты: {summary['total'] - summary['paid']}\n"
-        f"• Бесплатных дней: {detailed_stats['free_days']}\n"
-        f"• Платных дней: {detailed_stats['paid_days']}\n"
-        f"• Всего бонусных дней: {detailed_stats['total_bonus_days']}\n"
-        f"• Ожидают активации: {detailed_stats['pending_bonuses']}\n\n"
-        f"<b>Последние события:</b>\n"
-    )
-    
-    for event in events[:10]:
-        dt = fmt_date(event["created"])
-        event_type_text = {
-            "trial_bonus": "Бонус за переход",
-            "payment_bonus": "Бонус за оплату",
-            "registration": "Регистрация"
-        }.get(event["event_type"], "Событие")
-        
-        text += (
-            f"{event_type_text} {dt} — {event['days_awarded']} дней\n"
-            f"   ID: {event['referred_id']}\n"
-            f"   {event['description']}\n\n"
+    if not referral_stats:
+        await callback.message.edit_text(
+            f"<b>Реферал {referrer_id}</b>\n\n"
+            "Нет данных о рефералах.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Назад", callback_data="admin_referrals")
+            ]]),
+            parse_mode="HTML"
         )
+        return
     
-    if len(events) > 10:
-        text += f"... и еще {len(events) - 10} событий\n\n"
+    text = f"<b>👤 Реферал {referrer_id}</b>\n\n"
+    text += f"<b>Привлечено: {len(referral_stats)}</b>\n\n"
     
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Обновить", callback_data=callback.data)],
-        [InlineKeyboardButton(text="Все рефералы", callback_data="admin_referrals")]
-    ])
+    for i, stat in enumerate(referral_stats, 1):
+        date_str = datetime.fromtimestamp(stat["referral_date"]).strftime("%d.%m.%Y %H:%M")
+        source = stat["source"] or "telegram"
+        
+        if stat["bonus_amount"]:
+            bonus_date = datetime.fromtimestamp(stat["bonus_date"]).strftime("%d.%m.%Y") if stat["bonus_date"] else "-"
+            payment_date = datetime.fromtimestamp(stat["payment_date"]).strftime("%d.%m.%Y") if stat["payment_date"] else "-"
+            status_emoji = "✅" if stat["payment_status"] == "paid" else "⏳"
+            status_text = "Выплачено" if stat["payment_status"] == "paid" else "Ожидает"
+            
+            text += (
+                f"<b>{i}. Пользователь {stat['referred_id']}</b>\n"
+                f"   📅 Дата: {date_str}\n"
+                f"   📍 Источник: {source}\n"
+                f"   💰 Бонус: {stat['bonus_amount']}₽ ({bonus_date})\n"
+                f"   {status_emoji} Статус: {status_text}\n"
+                f"   💳 Оплата: {stat['payment_amount']}₽ ({payment_date})\n\n"
+            )
+        else:
+            text += (
+                f"<b>{i}. Пользователь {stat['referred_id']}</b>\n"
+                f"   📅 Дата: {date_str}\n"
+                f"   📍 Источник: {source}\n"
+                f"   ❌ Бонус не начислен (нет оплаты)\n\n"
+            )
     
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Назад", callback_data="admin_referrals")
+        ]]),
+        parse_mode="HTML"
+    )
 
 
 # ── Expired keys cleanup ─────────────────────────────────────────────────────
@@ -2120,7 +2267,7 @@ async def cb_mass_trial_confirm(callback: CallbackQuery, bot: Bot):
     from database import get_db
     db = await get_db()
     cur = await db.execute(
-        "SELECT DISTINCT u.user_id, u.username "
+        "SELECT DISTINCT u.user_id "
         "FROM users u "
         "LEFT JOIN keys k ON u.user_id = k.user_id AND k.is_active = 1 "
         "WHERE k.id IS NULL"
@@ -2145,7 +2292,7 @@ async def cb_mass_trial_confirm(callback: CallbackQuery, bot: Bot):
         reply_markup=_back_kb()
     )
     
-    for i, (user_id, username) in enumerate(rows):
+    for i, (user_id,) in enumerate(rows):
         try:
             # Check if already used trial
             from database import has_trial_used
@@ -2199,3 +2346,124 @@ async def cb_mass_trial_confirm(callback: CallbackQuery, bot: Bot):
         parse_mode="HTML",
         reply_markup=_back_kb()
     )
+
+
+@router.callback_query(F.data == "admin_mass_trial_5d")
+async def cb_mass_trial_5d(callback: CallbackQuery, bot: Bot):
+    """Give 5-day trial to ALL users (not just those without keys)."""
+    if not _is_admin(callback.from_user.id):
+        await safe_answer(callback, "Нет доступа.", alert=True)
+        return
+    
+    await safe_answer(callback)
+    
+    # Show confirmation dialog
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, выдать всем 5 дней", callback_data="admin_mass_trial_5d_confirm"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_menu")
+        ]
+    ])
+    
+    await callback.message.edit_text(
+        "🎁 <b>Массовая выдача пробников — 5 дней</b>\n\n"
+        "Выдать 5-дневный пробный период ВСЕМ пользователям?\n\n"
+        "⚠️ Это может занять некоторое время.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "admin_mass_trial_5d_confirm")
+async def cb_mass_trial_5d_confirm(callback: CallbackQuery, bot: Bot):
+    """Confirm and execute 5-day mass trial distribution to ALL users."""
+    if not _is_admin(callback.from_user.id):
+        await safe_answer(callback, "Нет доступа.", alert=True)
+        return
+    
+    await safe_answer(callback)
+    
+    # Get ALL users
+    db = await get_db()
+    cur = await db.execute("SELECT user_id FROM users")
+    rows = await cur.fetchall()
+    
+    if not rows:
+        await callback.message.edit_text(
+            "ℹ️ В базе нет пользователей.",
+            reply_markup=_back_kb()
+        )
+        return
+    
+    # Process trials
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    
+    status_msg = await callback.message.edit_text(
+        f"⏳ Выдаю пробники 5 дней {len(rows)} пользователям...\n"
+        f"✅ Успешно: 0\n"
+        f"❌ Ошибок: 0",
+        reply_markup=_back_kb()
+    )
+    
+    from subscription import deliver_key
+    
+    for i, (user_id,) in enumerate(rows):
+        try:
+            # Reset trial flag so user can receive
+            await reset_trial_for_user(user_id)
+            
+            # Deliver 5-day trial key
+            success = await deliver_key(
+                bot=bot,
+                user_id=user_id,
+                chat_id=user_id,
+                config_name=f"Trial5d-{user_id}",
+                days=5,
+                limit_ip=5,
+                is_paid=False,
+                amount=0,
+                currency="RUB",
+                method="admin_mass_trial_5d",
+                payload=f"mass_trial_5d_{user_id}",
+            )
+            
+            if success:
+                success_count += 1
+                logger.info(f"Mass trial 5d: delivered to user {user_id}")
+            else:
+                failed_count += 1
+                logger.warning(f"Mass trial 5d: failed to deliver to user {user_id}")
+                
+        except Exception as e:
+            failed_count += 1
+            logger.error(f"Mass trial 5d: error delivering to {user_id}: {e}")
+        
+        # Update status every 5 users
+        if (i + 1) % 5 == 0 or i == len(rows) - 1:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ Выдаю пробники 5 дней... ({i+1}/{len(rows)})\n"
+                    f"✅ Успешно: {success_count}\n"
+                    f"❌ Ошибок: {failed_count}",
+                    reply_markup=_back_kb()
+                )
+            except:
+                pass
+        
+        # Small delay to avoid rate limits
+        await asyncio.sleep(0.3)
+    
+    # Final report
+    await status_msg.edit_text(
+        f"✅ <b>Массовая выдача завершена</b>\n\n"
+        f"📊 <b>Параметры:</b> 5 дней каждому\n"
+        f"👥 <b>Всего пользователей:</b> {len(rows)}\n"
+        f"✅ <b>Успешно выдано:</b> {success_count}\n"
+        f"❌ <b>Ошибок:</b> {failed_count}",
+        parse_mode="HTML",
+        reply_markup=_back_kb()
+    )
+    
+    logger.info(f"Mass trial 5d completed: {success_count} success, {failed_count} failed out of {len(rows)} users")
